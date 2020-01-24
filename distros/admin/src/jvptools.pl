@@ -22,6 +22,7 @@ use IO::File;
 use JSON;
 use Pod::Usage;
 use POSIX qw( floor );
+use Spreadsheet::Read;
 use Storable qw(dclone);
 use XML::Simple;
 
@@ -97,6 +98,7 @@ MAIN: {
                           add_entrezgene_to_maf
                           sequence_lengths
                           qprofiler_genome
+                          identity1
                           );
 
     if ($mode =~ /^$valid_modes[0]$/i or $mode =~ /\?/) {
@@ -178,6 +180,9 @@ MAIN: {
     }
     elsif ($mode eq $valid_modes[25]) {
         qprofiler_genome();
+    }
+    elsif ($mode eq $valid_modes[26]) {
+        identity1();
     }
     else {
         die "jvptools mode [$mode] is unrecognised; valid modes are:\n   ".
@@ -2822,11 +2827,226 @@ sub qprofiler_genome {
 }
 
 
+sub identity1 {
+   
+    # Print help message if no CLI params
+    pod2usage( -exitval  => 0,
+               -verbose  => 99,
+               -sections => 'SYNOPSIS|COMMAND DETAILS/identity1' )
+        unless (scalar @ARGV > 0);
+
+    # Setup defaults for CLI params
+    my %params = ( excel       => '',
+                   samples     => [],
+                   qsigfiles   => [],
+                   outfile     => '',
+                   logfile     => '',
+                   verbose     => 0 );
+
+    my $results = GetOptions (
+           'x|excel=s'            => \$params{excel},         # -x
+           's|samples=s'          =>  $params{samples},       # -s
+           'q|qsigfiles=s'        =>  $params{qsigfiles},     # -q
+           'o|outfile=s'          => \$params{outfile},       # -o
+           'l|logfile=s'          => \$params{logfile},       # -l
+           'v|verbose+'           => \$params{verbose},       # -v
+           );
+
+    # It is mandatory to supply excel and outfile names
+    die "You must specify an Excel input file\n" unless $params{excel};
+    die "You must specify an output file\n" unless $params{outfile};
+
+    # Set up logging
+    glogfile($params{logfile}) if $params{logfile};
+    glogbegin;
+    glogprint( {l=>'EXEC'}, "CommandLine $CMDLINE\n" );
+    glogparams( \%params );
+
+    glogprint( 'found ', scalar(@{$params{samples}}), " samples\n" );
+    glogprint( 'found ', scalar(@{$params{qsigfiles}}), " qsignature files\n" );
+
+    my @all_samples = @{ $params{samples} };
+    my @all_qsigs   = @{ $params{qsigfiles} };
+
+    # List of target markers. Data structure has the following columns:
+    # Marker,Purpose,Chrom,Base Pair,Gene,Ref Allele,Alt Allele
+
+    my $markers_str = <<'END_MARKERS';
+rs1045728,Identity,6,99721049,FAXC,G,A
+rs10495563,Identity,2,9662210,ADAM17,G,A/C/T
+rs1065457,Identity,1,158324425,CD1E,A,G
+rs1127379,Identity,8,41121280,SFRP1,T,C
+rs1128536,Identity,20,44687999,SLC12A5,A,G
+rs1131906,Identity,1,202849723,RABIF,G,A/T
+rs11356,Identity,18,55268486,NARS,A,C
+rs11998387,Identity,8,110655337,SYBU,T,C
+rs1200349,Identity,15,41821752,RPAP1,T,C
+rs12102203,Identity,15,51791559,DMXL2,A,C/G
+rs12594531,Identity,15,72074505,THSD4,A,C/T
+rs132655,Identity,22,36557550,APOL3,C,G/T
+rs1344,Identity,1,147119273,ACP6,G,A
+rs140679,Identity,15,27772676,GABRG3,C,T
+rs1657502,Identity,2,96795608,ASTL,T,G
+rs17548783,Identity,7,48450157,ABCA13,T,C/G
+rs2246209,Identity,1,200145533,NR5A2,G,A
+rs2273171,Identity,14,31381351,STRN3,T,C
+rs2301771,Identity,16,20811681,ERI2,C,T
+rs2736588,Identity,11,5443700,OR51Q1,C,T
+rs2889732,Identity,20,31676804,BPIFB4,A,C
+rs3393,Identity,1,112042149,TMIGD3,C,T
+rs3737434,Identity,21,44437142,PKNOX1,A,C/G
+rs3743165,Identity,15,88405042,NTRK3,G,A
+rs3884596,Identity,11,7532175,OLFML1,T,G
+rs4478844,Identity,1,248129240,OR2AK2,G,A
+rs4664475,Identity,2,152387553,NEB,T,C
+rs4924,Identity,16,56396486,AMFR,C,T
+rs495680,Identity,13,33703656,STARD13,T,A/C
+rs586421,Identity,11,94865334,ENDOD1,T,C
+rs6090043,Identity,20,62717930,OPRL1,C,T
+rs6420424,Identity,16,81242102,PKD1L2,G,A
+rs6587161,Identity,17,21431819,LINC02693,C,T
+rs6977125,Identity,7,34388338,NPSR1-AS1,C,A/T
+rs707507,Identity,20,45363766,SLC2A10,T,C
+rs7105151,Identity,11,71117319,FLJ42102,G,A
+rs7186510,Identity,16,81730809,CMIP,G,A/C
+rs7653897,Identity,4,90169925,GPRIN3,A,G
+rs773901,Identity,19,17003789,CPAMD8,T,A/G
+rs7949414,Identity,11,122943495,CLMP,T,C
+rs843364,Identity,3,183900836,AP2M1,G,A
+rs8473,Identity,10,129899578,MMKI67,T,C
+rs9131,Identity,4,74963049,CXCL2,C,T
+rs9897794,Identity,17,28296327,EFCAB5,T,C/G
+END_MARKERS
+
+    # Open the output file
+    my $outfh = IO::File->new( $params{outfile}, 'w' );
+    die "unable to open file $params{outfile} for writing: $!" unless
+        defined $outfh;
+
+    # Parse the target markers out of the heredoc
+    my @temp_markers = split /\n/, $markers_str;
+    my @target_markers = ();
+    my %target_markers = ();
+    my $tm_ctr = 0;
+    foreach my $marker (@temp_markers) {
+        my @fields = split /,/, $marker;
+        $target_markers{$fields[0]} = { index  => $tm_ctr,
+                                        fields => \@fields };
+        push @target_markers, $fields[0];
+        $tm_ctr++;
+    }
+    glogprint( 'target marker count: ', $tm_ctr-1, "\n" );
+
+    # Process Excel sheet
+
+    my $workbook = Spreadsheet::Read->new( $params{excel} );
+    my $info = $workbook->[0];
+    glogprint( 'Parsed "', $params{excel}, '" with version ',
+               $info->{parser}, '-', $info->{version}, "\n" );
+    my $results_sheet = $workbook->sheet("Results");
+    die "unable to find sheet Results: $!" unless defined $results_sheet;
+
+    # Parse the results markers out of the spreadsheet
+
+    my @results_markers = $results_sheet->cellrow(1);
+    my %results_markers = ();
+    my $rm_ctr = 0;
+    foreach my $marker (@results_markers) {
+        # Skip empty markers (but keep the ctr matched up)
+        if ($marker) {
+            $results_markers{$marker} = { index => $rm_ctr };
+        }
+        $rm_ctr++;
+    }
+    glogprint( 'results marker count: ', $rm_ctr-1, "\n" );
+
+    # Compare the target markers from the heredoc with the list of
+    # markers found in the Results tab of the Excel spreadsheet
+
+    foreach my $marker (sort keys %target_markers) {
+        glogprint( {l=>'WARN'}, "target marker $marker not found in spreadsheet\n" )
+            unless exists $results_markers{ $marker };
+    }
+    foreach my $marker (sort keys %results_markers) {
+        glogprint( {l=>'WARN'}, "spreadsheet marker $marker not found in targets\n" )
+            unless exists $target_markers{ $marker };
+    }
+
+    # Decompose Results spreadsheet into a composite hash keyed on
+    # $sample and $marker.
+
+    glogprint( "parsing Results sheet from Excel workbook\n" );
+    my @sheet_samples = $results_sheet->cellcolumn(1);
+    my $max_samples = scalar @sheet_samples -1;
+    glogprint( '  samples: ', join ',',@sheet_samples, "\n" );
+    my @sheet_markers = $results_sheet->cellrow(1);
+    my $max_markers = scalar @sheet_markers -1;
+    glogprint( '  markers: ', join ',',@sheet_markers, "\n" );
+    my %calls = ();
+    foreach my $row_idx (1..$max_samples) {
+        foreach my $col_idx (1..$max_markers) {
+            # Skip any cells that do not have a marker and sample 
+            #next unless (defined $sample and $defined $marker);
+            my $sample = $sheet_samples[$row_idx];
+            my $marker = $sheet_markers[$col_idx];
+            # Note that the cell indexes are NOT the same as the marker
+            # and sample indexes
+            my $call   = $results_sheet->cell( $col_idx+1, $row_idx+1 );
+            $outfh->print( join("\t", $row_idx, $sample, $col_idx, $marker, $call),"\n" ); 
+            $calls{ $sample }->{ $marker } = $call;
+        }
+    }
+    #print Dumper \%calls;
+
+    # Compare all samples against each other
+    glogprint( "comparing genotypes between all samples\n" );
+    die "not enough samples" unless scalar(@all_samples) > 1;
+    my $last_sample_idx = scalar @all_samples -1;
+    foreach my $index1 (0..($last_sample_idx-1)) {
+        foreach my $index2 (($index1+1)..$last_sample_idx) {
+            my $sample1 = $all_samples[$index1];
+            my $sample2 = $all_samples[$index2];
+            if (!defined $sample1) {
+                glogprint( {l=>'WARN'}, "no sample at index1 ($index1)\n" );
+                next;
+            }
+            elsif (!defined $sample2) {
+                glogprint( {l=>'WARN'}, "no sample at index2 ($index2)\n" );
+                next;
+            }
+            glogprint( "  $sample1 vs $sample2\n" );
+            my $concordant = 0;
+            my $discordant = 0;
+            foreach my $marker (@sheet_markers) {
+                next unless $marker;
+                my $call1 = $calls{$sample1}{$marker};
+                my $call2 = $calls{$sample2}{$marker};
+                if ($call1 eq $call2) {
+                    $concordant++;
+                } else {
+                    glogprint( {l=>'WARN'},
+                               "    $sample1 ($call1) vs $sample2 ($call2) discordant at marker $marker\n" );
+                    $discordant++;
+                }
+            }
+            my $total = $concordant+$discordant;
+            glogprint( "    $sample1 vs $sample2 concordance rate is ",
+                           $concordant/$total, " ($concordant of $total)\n" );
+        }
+    }
+
+    $outfh->close;
+
+    glogend;
+}
+
+
+
 __END__
 
 =head1 NAME
 
-jvptools.pl - Perl bits-b-pieces
+jvptools.pl - Perl bits-n-pieces
 
 
 =head1 SYNOPSIS
@@ -2843,27 +3063,6 @@ get written and placed in more and more directories.  At least this way
 there is only one script and POD block to grep when you are looking for
 that routine you know you wrote but can't remember where it is.
 
-
-__END__
-
-=head1 NAME
-
-jvptools.pl - Perl bits-b-pieces
-
-
-=head1 SYNOPSIS
-
- jvptools.pl command [options]
-
-
-=head1 ABSTRACT
-
-This script is a collection of snippets of perl code that do various
-small but useful tasks.  In the past I would have made each of these as
-a separate script but that way leads to madness as more and more scripts
-get written and placed in more and more directories.  At least this way
-there is only one script and POD block to grep when you are looking for
-that routine you know you wrote but can't remember where it is.
 
 =head1 COMMANDS
 
@@ -2885,6 +3084,7 @@ that routine you know you wrote but can't remember where it is.
  add_entrezgene_to_maf - add Entrez Gene Id numbers to MAF
  sequence_lengths   - output the length of each sequence in a FASTA
  qprofiler_genome   - output JSON file with properties from a genome FASTA
+ identity1          - Calculate identity statistics
  version            - print version number and exit immediately
  help               - display usage summary
  man                - display full man page
@@ -3255,6 +3455,16 @@ The MAF spec is at:
 
 https://wiki.nci.nih.gov/display/TCGA/Mutation+Annotation+Format+%28MAF%29+Specification
 
+=head2 identity1
+
+ -x | --excel      Identity file in Excel format (ExomeID)
+ -n | --name       Name of sample to be tested for identity
+ -q | --qsigfiles  qSignature files to be used for comparison
+ -o | --outfile    output CNV file in GapSummary format
+ -l | --logfile    log file (optional)
+ -v | --verbose    print progress and diagnostic messages
+
+Calculate identity statistics. This tool uses ExomeID results from AGRF.
 
 =head1 AUTHOR
 
