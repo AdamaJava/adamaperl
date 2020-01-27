@@ -99,6 +99,7 @@ MAIN: {
                           sequence_lengths
                           qprofiler_genome
                           identity1
+                          identity2
                           );
 
     if ($mode =~ /^$valid_modes[0]$/i or $mode =~ /\?/) {
@@ -183,6 +184,9 @@ MAIN: {
     }
     elsif ($mode eq $valid_modes[26]) {
         identity1();
+    }
+    elsif ($mode eq $valid_modes[27]) {
+        identity2();
     }
     else {
         die "jvptools mode [$mode] is unrecognised; valid modes are:\n   ".
@@ -2839,7 +2843,8 @@ sub identity1 {
     my %params = ( excel       => '',
                    samples     => [],
                    qsigfiles   => [],
-                   outfile     => '',
+                   gmatrix     => '',
+                   cmatrix     => '',
                    logfile     => '',
                    verbose     => 0 );
 
@@ -2847,14 +2852,16 @@ sub identity1 {
            'x|excel=s'            => \$params{excel},         # -x
            's|samples=s'          =>  $params{samples},       # -s
            'q|qsigfiles=s'        =>  $params{qsigfiles},     # -q
-           'o|outfile=s'          => \$params{outfile},       # -o
+           'g|gmatrix=s'          => \$params{gmatrix},       # -g
+           'c|cmatrix=s'          => \$params{cmatrix},       # -c
            'l|logfile=s'          => \$params{logfile},       # -l
            'v|verbose+'           => \$params{verbose},       # -v
            );
 
     # It is mandatory to supply excel and outfile names
     die "You must specify an Excel input file\n" unless $params{excel};
-    die "You must specify an output file\n" unless $params{outfile};
+    die "You must specify a genotype matrix output file\n" unless $params{gmatrix};
+    die "You must specify a correlation matrix output file\n" unless $params{cmatrix};
 
     # Set up logging
     glogfile($params{logfile}) if $params{logfile};
@@ -2918,10 +2925,15 @@ rs9131,Identity,4,74963049,CXCL2,C,T
 rs9897794,Identity,17,28296327,EFCAB5,T,C/G
 END_MARKERS
 
-    # Open the output file
-    my $outfh = IO::File->new( $params{outfile}, 'w' );
-    die "unable to open file $params{outfile} for writing: $!" unless
-        defined $outfh;
+    # Open the genotype matrix output file
+    my $gmatfh = IO::File->new( $params{gmatrix}, 'w' );
+    die "unable to open file $params{gmatrix} for writing: $!" unless
+        defined $gmatfh;
+
+    # Open the correlation matrix output file
+    my $cmatfh = IO::File->new( $params{cmatrix}, 'w' );
+    die "unable to open file $params{cmatrix} for writing: $!" unless
+        defined $cmatfh;
 
     # Parse the target markers out of the heredoc
     my @temp_markers = split /\n/, $markers_str;
@@ -2930,12 +2942,20 @@ END_MARKERS
     my $tm_ctr = 0;
     foreach my $marker (@temp_markers) {
         my @fields = split /,/, $marker;
-        $target_markers{$fields[0]} = { index  => $tm_ctr,
-                                        fields => \@fields };
+        my $location = substr( '00'. $fields[2], -2 ) .':'.
+                       substr( '0000000000'. $fields[3], -10 );
+        $target_markers{$fields[0]} = { index    => $tm_ctr,
+                                        location => $location,
+                                        fields   => \@fields };
         push @target_markers, $fields[0];
         $tm_ctr++;
     }
     glogprint( 'target marker count: ', $tm_ctr-1, "\n" );
+
+    # Create a list of the markers sorted in chrom:location order
+    my @sorted_markers = map  { $_->[0] }
+                         sort { $a->[1] cmp $b->[1] }
+                         map  { [ $_, $target_markers{$_}->{location} ] } keys %target_markers;
 
     # Process Excel sheet
 
@@ -2992,19 +3012,31 @@ END_MARKERS
             # Note that the cell indexes are NOT the same as the marker
             # and sample indexes
             my $call   = $results_sheet->cell( $col_idx+1, $row_idx+1 );
-            $outfh->print( join("\t", $row_idx, $sample, $col_idx, $marker, $call),"\n" ); 
-            $calls{ $sample }->{ $marker } = $call;
+
+            # It is not clear what the order is fr the bases in ExomeID
+            # calls so we will sort the two alleles for consistency with
+            # the way we report from sequencing.
+
+            my $genotype = join( '', sort( split( //, $call) ) );
+
+            #print( join("\t", $row_idx, $sample, $col_idx, $marker, $call),"\n" ); 
+            $calls{ $sample }->{ $marker } = $genotype;
         }
     }
     #print Dumper \%calls;
 
-    # Compare all samples against each other
+    # Compare all samples against each other. t may seem wasteful but
+    # this should include a comparison vs self annd comparisons in both
+    # directions so for 3 samples it should be a 3x3 matrix,
     glogprint( "comparing genotypes between all samples\n" );
     die "not enough samples" unless scalar(@all_samples) > 1;
     my $last_sample_idx = scalar @all_samples -1;
-    foreach my $index1 (0..($last_sample_idx-1)) {
-        foreach my $index2 (($index1+1)..$last_sample_idx) {
-            my $sample1 = $all_samples[$index1];
+    #foreach my $index1 (0..($last_sample_idx-1)) {
+    foreach my $index1 (0..$last_sample_idx) {
+        my $sample1 = $all_samples[$index1];
+        $cmatfh->print( $sample1 );
+        #foreach my $index2 (($index1+1)..$last_sample_idx) {
+        foreach my $index2 (0..$last_sample_idx) {
             my $sample2 = $all_samples[$index2];
             if (!defined $sample1) {
                 glogprint( {l=>'WARN'}, "no sample at index1 ($index1)\n" );
@@ -3017,28 +3049,246 @@ END_MARKERS
             glogprint( "  $sample1 vs $sample2\n" );
             my $concordant = 0;
             my $discordant = 0;
-            foreach my $marker (@sheet_markers) {
+            my $uncalled   = 0;
+            # We use the sorted target markers list so that we skip the
+            # gender and any other sheet markers.
+            foreach my $marker (@sorted_markers) {
                 next unless $marker;
                 my $call1 = $calls{$sample1}{$marker};
                 my $call2 = $calls{$sample2}{$marker};
-                if ($call1 eq $call2) {
+                if ($call1 =~ /fail/i) {
+                    $uncalled++;
+                    glogprint( {l=>'WARN'},
+                               "    $sample1 ($call1) not called at marker $marker\n" );
+                }
+                elsif ($call2 =~ /fail/i) {
+                    $uncalled++;
+                    glogprint( {l=>'WARN'},
+                               "    $sample2 ($call2) not called at marker $marker\n" );
+                }
+                elsif ($call1 eq $call2) {
                     $concordant++;
-                } else {
+                }
+                else {
                     glogprint( {l=>'WARN'},
                                "    $sample1 ($call1) vs $sample2 ($call2) discordant at marker $marker\n" );
                     $discordant++;
                 }
             }
+            $cmatfh->print( "\t$discordant" );
+            # We are ignoring $uncalled so it doesn't go into the math
             my $total = $concordant+$discordant;
             glogprint( "    $sample1 vs $sample2 concordance rate is ",
                            $concordant/$total, " ($concordant of $total)\n" );
         }
+        $cmatfh->print( "\n" );
     }
 
+    $cmatfh->close;
+
+    $gmatfh->print( "# ExomeID sample names - in table column order\n" );
+    foreach my $sample (@all_samples) {
+        $gmatfh->print( "# $sample\n" );
+    }
+    foreach my $marker (@sorted_markers) {
+        $gmatfh->print( join("\t",@{$target_markers{$marker}->{fields}}) );
+        foreach my $sample (@all_samples) {
+            my $call = $calls{$sample}{$marker};
+            $gmatfh->print( "\t$call" );
+        }
+        $gmatfh->print( "\n" );
+    }
+
+    $gmatfh->close;
+
+    glogend;
+}
+
+
+sub identity2 {
+   
+    # Print help message if no CLI params
+    pod2usage( -exitval  => 0,
+               -verbose  => 99,
+               -sections => 'SYNOPSIS|COMMAND DETAILS/identity2' )
+        unless (scalar @ARGV > 0);
+
+    # Setup defaults for CLI params
+    my %params = ( qsigfiles   => [],
+                   outfile     => '',
+                   logfile     => '',
+                   verbose     => 0 );
+
+    my $results = GetOptions (
+           'q|qsigfiles=s'        =>  $params{qsigfiles},     # -q
+           'o|outfile=s'          => \$params{outfile},       # -o
+           'l|logfile=s'          => \$params{logfile},       # -l
+           'v|verbose+'           => \$params{verbose},       # -v
+           );
+
+    # It is mandatory to supply excel and outfile names
+    die "You must specify an output file\n" unless $params{outfile};
+
+    # Set up logging
+    glogfile($params{logfile}) if $params{logfile};
+    glogbegin;
+    glogprint( {l=>'EXEC'}, "CommandLine $CMDLINE\n" );
+    glogparams( \%params );
+
+    glogprint( 'found ', scalar(@{$params{qsigfiles}}), " qsignature files\n" );
+
+    my @all_qsigs   = @{ $params{qsigfiles} };
+
+    # Process qsignature files which are gzip'd VCF's
+
+    my @variant_order = ();
+    my $variant_order_set = 0;
+    my %variants = ();
+    foreach my $qsigfile (@all_qsigs) {
+        glogprint( "processing qsignature file $qsigfile\n" );
+
+        my $qsigfh = undef;
+        if ( $qsigfile =~ /\.gz$/ ) {
+            $qsigfh = IO::Zlib->new( $qsigfile, 'r' );
+            confess 'Unable to open ', $qsigfile, " for reading: $!"
+                unless defined $qsigfh;
+            glogprint( "  file is gz compressed\n" );
+        }
+        else {
+            $qsigfh = IO::File->new( $qsigfile, 'r' );
+            confess 'Unable to open ', $qsigfile, " for reading: $!"
+                unless defined $qsigfh;
+            glogprint( "  file is not gz compressed\n" );
+        }
+ 
+        my $expected_header_line = "##fileformat=VCFv4.2\n";
+        my $observed_header_line = $qsigfh->getline;
+
+        if ($expected_header_line ne $observed_header_line) {
+            die "  found $observed_header_line\nexpected $expected_header_line\n";
+        }
+
+        # Limits for genotype calling
+        my $min_depth = 20;
+        my $min_proportion_in_2_most_abundant_bases = 0.9;
+        my $min_proportion_to_call_as_hom = 0.9;
+        my $max_ratio_to_call_as_het = 3.0;
+
+        my $vctr = 0;
+        while (my $line = $qsigfh->getline) {
+            next if ($line =~ /^#/);
+            chomp $line;
+            next unless $line;
+            my @fields = split /\t/, $line;
+            $vctr++;
+            #my $index = $fields[0] .':'. substr('000000000000'.$fields[1], -10);
+            my $index = $fields[0] .':'. $fields[1];
+            if (! $variant_order_set) {
+                push @variant_order, $index;
+            }
+
+            # This is what we have to parse in fields[7]:
+            # QAF=t:0-0-0-51,rg1:0-0-0-23,rg2:0-0-0-28
+            my $genotype = '--';
+
+            my @bases = ();
+            if ($fields[7] =~ /^QAF=t:(\d+)-(\d+)-(\d+)-(\d+),rg.*/) {
+                push @bases, [ 'A', $1 ],
+                             [ 'C', $2 ],
+                             [ 'G', $3 ],
+                             [ 'T', $4 ];
+
+                # Sort according to base count
+                @bases = map  { $_->[0] }
+                         sort { $b->[1] <=> $a->[1] }
+                         map  { [ $_, $_->[1] ] } @bases;
+
+                # Check 1 - 2 biggest must be more than 90% of all bases
+                my $total = $bases[0]->[1] + $bases[1]->[1] +
+                            $bases[2]->[1] + $bases[3]->[1];
+                my $first2 = $bases[0]->[1] + $bases[1]->[1];
+
+                if ( $total < $min_depth ) {
+                    glogprint( {l=>"WARN"}, "for $index there are only $total bases so we cannot call a genotype $fields[7]\n" );
+                }
+                elsif ( ($first2 / $total) <= $min_proportion_in_2_most_abundant_bases ) {
+                    glogprint( {l=>"WARN"}, "for $index the two top alleles are <90% of the total bases $fields[7]\n" );
+                }
+                elsif (($bases[0]->[1] / $total) > $min_proportion_to_call_as_hom) {
+                    $genotype = $bases[0]->[0] . $bases[0]->[0];
+                }
+                elsif (($bases[0]->[1] / $bases[1]->[1]) < $max_ratio_to_call_as_het) {
+                    my @geno_bases = sort ($bases[0]->[0],$bases[1]->[0]);
+                    $genotype = join('', @geno_bases);
+                }
+                else {
+                    glogprint( {l=>"WARN"}, "for $index the base distribution is weird and we can't call hom or het $fields[7]\n" );
+                }
+
+            }
+            else {
+                die "could not parse variant $index $fields[7]\n"; 
+            }
+
+            glogprint( "  called $genotype from $fields[7] for $index\n" );
+
+            $variants{$qsigfile}->{$index} = $genotype;
+        }
+        glogprint( "  found $vctr variants\n" );
+
+        # Flag that we have chosen a variant order
+        $variant_order_set = 1;
+    }
+
+    #print Dumper \%variants, \@variant_order;
+
+    # Open the output file. We are also going to keep a track of
+    # mismatches so for each location, we will keep a tally of observed
+    # genotypes, ignore uncalled genotypes and if there is stillmore
+    # than one then we report the small number as being the mismatches.
+
+    my $outfh = IO::File->new( $params{outfile}, 'w' );
+    die "unable to open file $params{outfile} for writing: $!" unless
+        defined $outfh;
+
+    $outfh->print( "# qsignature file sample names - in table column order\n" );
+    foreach my $qsigfile (@all_qsigs) {
+        $outfh->print(  "# $qsigfile\n" );
+    }
+    foreach my $index (@variant_order) {
+        my ($chr, $loc) = split /:/, $index;
+        $outfh->print( "$chr\t$loc" );
+        my %seen_genotypes = ();
+        foreach my $qsigfile (@all_qsigs) {
+            my $genotype = $variants{$qsigfile}->{$index};
+            $outfh->print( "\t", $genotype );
+            if ($genotype ne '--') {
+                $seen_genotypes{ $genotype }++;
+            }
+        }
+
+        # Check for mismatches
+        my @counts = sort { $b <=> $a } values %seen_genotypes;
+        if (scalar @counts > 1) {
+            # Remove the consensus (largest) genotype count and add up
+            # any others.
+            shift @counts;
+            my $mismatches = 0;
+            $mismatches += $_ foreach @counts;
+            $outfh->print( "\t", $mismatches );
+        }
+        else {
+            $outfh->print( "\t0" );
+        }
+
+
+        $outfh->print( "\n" );
+    }
     $outfh->close;
 
     glogend;
 }
+
 
 
 
@@ -3458,24 +3708,30 @@ https://wiki.nci.nih.gov/display/TCGA/Mutation+Annotation+Format+%28MAF%29+Speci
 =head2 identity1
 
  -x | --excel      Identity file in Excel format (ExomeID)
- -n | --name       Name of sample to be tested for identity
+ -s | --samples    Samples from -x to be tested for identity
  -q | --qsigfiles  qSignature files to be used for comparison
- -o | --outfile    output CNV file in GapSummary format
+ -o | --outfile    
  -l | --logfile    log file (optional)
  -v | --verbose    print progress and diagnostic messages
 
 Calculate identity statistics. This tool uses ExomeID results from AGRF.
 
+=head2 identity2
+
+ -q | --qsigfiles  qSignature files to be used for comparison
+ -o | --outfile    output file showing genotypes
+ -l | --logfile    log file (optional)
+ -v | --verbose    print progress and diagnostic messages
+
+Calculate naive genotypes from qsignature VCF files. This is required so
+that ExomeID and qsignature genotypes can be compared.  It is testing
+for mode identity1.
+
 =head1 AUTHOR
 
 =over 2
 
-=item John Pearson, L<mailto:j.pearson@uq.edu.au>
-=head1 AUTHOR
-
-=over 2
-
-=item John Pearson, L<mailto:j.pearson@uq.edu.au>
+=item John Pearson, L<mailto:john.pearson@qimrberghofer.edu.au>
 
 =back
 
@@ -3489,7 +3745,7 @@ $Id: jvptools.pl 8281 2014-06-20 06:32:55Z j.pearson $
 
 Copyright 2012-2014  The University of Queensland
 Copyright 2012-2014  John V Pearson
-Copyright 2014-2016  QIMR Berghofer Medical Research Institute
+Copyright 2014-2020  QIMR Berghofer Medical Research Institute
 
 All rights reserved.  This License is limited to, and you
 may use the Software solely for, your own internal and non-commercial
